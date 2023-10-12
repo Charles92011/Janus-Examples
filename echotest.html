@@ -1,0 +1,369 @@
+<html lang="en">
+	<!--
+		This program demonstrates basic connection to a MeetEcho Janus WebRTC server
+		then attaches to the EchoTest plugin, which simply sends the user's media back
+		to its source.
+		No external javascript is used. Connection with the Janus server is accomplished
+		via a standard websocket and RTCPeerConnection
+		As muhc information is output through the log as possible, to demonstrate the process
+		as it's happening
+	--> 
+	<head>
+		<meta charset="utf-8">
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+		<title>Janus WebSockets</title>
+		<link rel="icon" href="data:;base64,iVBORwOKGO=">
+		<style>
+			video {width:320px; height:240px; border: 1px solid black;}
+			.localVideo {border: 3px solid red;}
+			.remoteVideo {border: 3px solid blue;}
+			.hidden {display: none;}
+		</style>
+	</head>
+	<body>
+		<button id="goButton">go</button>
+		<div id="videos">
+			<video id="localVideo" class="localVideo" autoplay playsinline muted></video>
+			<video id="remoteVideo" class="remoteVideo" autoplay playsinline muted></video>
+		</div>
+		<script type="text/javascript">
+		'use strict';
+		function $(id) {return document.getElementById(id);}
+		function $hide(id) {$(id).classList.add("hidden");}
+		function $show(id) {$(id).classList.remove("hidden");}
+		
+		const janusUrl = "wss://MYJANUSSERVER/janus";
+		const iceServers = [{"urls": "stun:stun.l.google.com:19302"}];
+		const apiSecret = "MY API SECRET CODE"
+		
+		var webSocket;
+		var sessionId;
+		var pluginId;
+		
+		const keepAlivePeriod = 25000;
+		var keepAliveTimer;
+		
+		const localVideo = $('localVideo');
+		const localStream = new MediaStream();
+
+		const remoteVideo = $('remoteVideo');
+		const remoteStream = new MediaStream();
+		
+		var peerConnection;
+		
+		var answered = false;
+		const candidates = [];
+
+		$('goButton').addEventListener('click', (event) => {
+
+			localVideo.srcObject = localStream;
+			remoteVideo.srcObject = remoteStream;
+
+
+			// Open websocket
+			console.log(`Opening websocket ${janusUrl}`);
+			webSocket = new WebSocket(janusUrl, 'janus-protocol');
+			webSocket.onopen	= wsOpen;
+			webSocket.onclose	= wsClose;
+			webSocket.onmessage	= wsMessage;
+
+		});
+		
+		function wsOpen(event) {
+
+			console.log(`Web Socket Opened ${janusUrl}`);
+
+			// send a request to open a news Janus session
+			const request = {
+				'janus' : 'create',
+				'transaction' : 'createSession',
+				'apisecret' : apiSecret
+			};
+			const message = JSON.stringify(request);
+			console.log(`Creating session\n${message}`)
+			webSocket.send(message);
+		}
+		
+		function wsClose(event) {
+			clearInterval(keepAliveTimer);
+			console.log(`Web Socket Closed ${janusUrl}`);
+		}
+		
+		function wsKeepAlive(event) {
+		
+			// KeepAlive messages are sent to Janus on a periodic interval
+			// to keep the session alive, even when there is no activity
+			const request = {
+				"janus" : "keepalive",
+				"session_id" : sessionId,
+				"transaction" : "keepAlive",
+				'apisecret' : apiSecret
+			};
+
+			const message = JSON.stringify(request);
+			webSocket.send(message);
+		}
+		
+		function wsMessage(event) {
+
+			const message		= event.data;
+			const response		= JSON.parse(message);
+			
+			const janus			= response.janus;
+			const transaction	= response.transaction;
+			const data			= response.data;
+			const pluginData	= response.pluginData;
+			
+			const jsep			= response.jsep;
+			const candidate		= response.candidate;
+			
+			if (janus == 'ack' && transaction == 'keepAlive') return;	// don't want to see a constant stream of keep alive messages
+
+			console.log(`message received\n${message}`);
+
+			if (candidate)	{
+				// if the Janus server sends us any ICE candidates before it has sent
+				// an answer to our offer, we'll save them until the answer arrives
+				if (answered)	peerConnection.addIceCandidate(candidate);
+				else 			candidates.push(candidate);
+			}
+
+			if (jsep) {
+			
+				console.log(`setting remote description`);
+			
+				// the answer has arrived, set the remote description of the peerconnection
+				peerConnection.setRemoteDescription(jsep)
+				.then(() => {
+					console.log(`Description received, peer Connection set`);
+					answered = true;
+					
+					// if any candidates were cached before the answer arrived, add them now
+					while (candidates.length) {
+						const candidate = candidates.shift();
+				
+						console.log(`adding reserved iceCandidate ${candidate}`, candidate);
+
+						peerConnection.addIceCandidate(candidate);
+					}
+				});
+			}
+
+			if (pluginData) {
+				
+				if (pluginData.data.result == 'done') peerConnection.close();
+			}
+
+
+			// success could be sent by any number of plugin messages, so we'll 
+			// use the transaction to tell us which one it was
+			if (janus == 'success') {
+			
+				// Session was created, attach to the echotest plugin
+				if (transaction == 'createSession') {
+				
+					sessionId = data.id;
+					console.log(`session ${sessionId} created`);
+					
+					
+					keepAliveTimer = setInterval(wsKeepAlive, keepAlivePeriod);
+					console.log(`keepAlive started`);
+					
+					const request = {
+						'janus' : 'attach',
+						'session_id' : sessionId,
+						'plugin' : 'janus.plugin.echotest',
+						'trickle' : 'true',
+						'transaction' : 'attachPlugin',
+						'apisecret' : apiSecret
+					};
+					const message = JSON.stringify(request);
+					console.log(`attaching plugin\n${message}`);
+					webSocket.send(message);
+					
+				// the plugin was attached, tell Janus what media to expect from us
+				} else if (transaction == 'attachPlugin') {
+					pluginId = data.id;
+					sendJanusMessage('media', {'audio':false, 'video':true});
+				}
+
+			} else if (janus == 'event') {
+				// Janus has acknowledged our desire to send video
+				// We'll open the peer connection
+				if (transaction == 'media') openPeerConnection();
+
+			} else if (janus == 'hangup') {
+				
+				webSocket.close();
+			}
+		}
+
+		function sendJanusMessage(subject, body, jsep) {
+		
+			// messages sent to the plugin take the same form every time
+			const request = {
+				"janus" : "message"
+			};
+			
+			request.transaction = subject;
+			request.body		= body			
+			request.session_id	= sessionId;
+			request.handle_id	= pluginId;
+			request.apisecret	= apiSecret;
+
+			if (jsep) {
+				request.jsep = {
+					type: jsep.type,
+					sdp: jsep.sdp
+				}
+			};
+			
+			const message = JSON.stringify(request);
+			console.log(`sending message\n${message}`);
+			webSocket.send(message);
+		}
+
+		function openPeerConnection() {
+
+			const pcOptions = {
+				iceServers: iceServers,
+				sdpSemantics: 'unified-plan'
+			};
+
+			console.log(`opening peerconnection ${JSON.stringify(pcOptions)}`);
+
+			peerConnection = new RTCPeerConnection(pcOptions);
+			// We don't need to repsond to every event, but for the purposes of debugging, 
+			// it's good to see what's going on. So non-critical events are sent to 
+			// onPeerConnection so they can be logged out
+			peerConnection.onconnectionstatechange	= onPeerConnection;
+			peerConnection.ondatachannel			= onPeerConnection;
+			peerConnection.onicecandidate 			= onIceCandidate;
+			peerConnection.onicecandidateerror		= onPeerConnection;
+			peerConnection.oniceconnectionstatechange	= onPeerConnection;
+			peerConnection.onicegatheringstatechange	= onPeerConnection;
+			peerConnection.onnegotiationneeded		= negotiate;
+			peerConnection.onsignalingstatechange	= onPeerConnection;
+			peerConnection.ontrack					= onTrack;
+
+			// we want to keep this demo as simple as possible,
+			// so we only request a single track
+			const mediaStreamConstraints = {'audio': false, 'video': true};
+
+			// when the tracks are added to the peer connection, it will 
+			// trigger a negotiation needed event.
+			navigator.mediaDevices.getUserMedia(mediaStreamConstraints)
+			.then((mediaStream) => {
+				for (const track of mediaStream.getTracks()) {
+					localStream.addTrack(track);
+					peerConnection.addTrack(track);					// will trigger negotiation
+				}
+			});		
+			
+			console.log(`Created peer connection`);
+
+			//negotiate();											// use this if you're going to connect first before adding media
+		}
+		
+		// create a new offer and send it to the Janus server
+		function negotiate(event) {
+		
+			const offerOptions = {'offerToReceiveVideo': true, 'offerToReceiveAudio': false};
+			
+			answered = false;
+			
+			peerConnection.createOffer(offerOptions)
+			.then((offer) =>{
+			
+				peerConnection.setLocalDescription(offer);
+			
+				const jsep = {
+					type: 'offer',
+					sdp: offer.sdp
+				};
+				const body = { 'audio': false, 'video': true };
+				sendJanusMessage('makeOffer', body, jsep);
+				
+			});
+		}
+
+		function onPeerConnection(event) {
+		
+			if (event.type == 'connectionstatechange')		{console.log(`${event.type} - ${peerConnection.connectionState}`); return;}
+			if (event.type == 'iceconnectionstatechange')	{console.log(`${event.type} - ${peerConnection.iceConnectionState}`); return;}
+			if (event.type == 'icegatheringstatechange')	{console.log(`${event.type} - ${peerConnection.iceGatheringState}`); return;}
+			if (event.type == 'signalingstatechange')		{console.log(`${event.type} - ${peerConnection.signalingState}`); return;}
+			
+			console.log(`onPeerConnection: ${event.type}`);
+
+		}
+		
+		// The peer connection has received an ICE candidate
+		// Send it to Janus to update its side of the connection
+		function onIceCandidate(event) {
+		
+			const candidate = event.candidate;
+			console.log(`${event.type} - ${candidate}`);
+
+			const request = {
+				'janus' : 'trickle'
+			};
+			
+			if (candidate) {
+				request.candidate = { 
+					candidate: candidate.candidate,
+					sdpMid: candidate.sdpMid,
+					sdpMLineIndex: candidate.sdpMLineIndex
+				};
+				request.transaction = 'iceCandidate';
+					
+			} else {
+				request.candidate = { 'completed' : true };
+				request.transaction = 'iceComplete';
+
+			}
+
+			request.session_id = sessionId;
+			request.handle_id = pluginId;
+			request.apisecret = apiSecret;
+	
+			const message = JSON.stringify(request);
+			console.log(`sending candidate\n${message}`);
+			webSocket.send(message);
+		}
+
+		
+		// The peerConnection has received a media track
+		// Add it to the remotestream for display
+		function onTrack(event) {
+		
+			const track = event.track;
+
+			console.log(`remote track:\n`, track);
+
+			if(track.onended) return;
+
+			remoteStream.addTrack(track);
+
+			track.onended = (event) => {
+			
+				console.log(`remote track ended:\n`, track);
+				remoteStream.removetrack(track);
+			}
+			
+			track.onmute = (event) => {
+
+				console.log(`remote track muted:\n`, track);
+
+			}
+			
+			track.onunmute = (event) => {
+
+				console.log(`remote track unmuted:\n`, track);
+
+			}
+		}
+
+		</script>
+	</body>
+</html>
