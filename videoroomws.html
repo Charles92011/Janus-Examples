@@ -1,0 +1,545 @@
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+		<title>Janus WebSockets</title>
+		<link rel="icon" href="data:;base64,iVBORwOKGO=">
+		<style>
+			video {width:320px; height:240px; border: 3px solid blue;}
+			.local {border: 3px solid red;}
+			.hidden {display: none;}
+		</style>
+	</head>
+	<body>
+		<button id="goButton">go</button>
+		<div id="videos">
+		</div>
+		<script type="text/javascript">
+		'use strict';
+		function $(id) {return document.getElementById(id);}
+		function $hide(id) {$(id).classList.add("hidden");}
+		function $show(id) {$(id).classList.remove("hidden");}
+		
+		const janusUrl = "";
+		const iceServers = [];
+		const apiSecret = ""
+		
+		var myName;
+		var myUUid;
+
+		var myIdentifier = {};
+		var localId;
+		var privateId;
+		
+		var webSocket;
+		var sessionId;
+		var pluginId;
+		
+		const keepAlivePeriod = 25000;
+		var keepAliveTimer;
+		
+		const roomId = 4321;
+		
+		const pcOptions = {
+			iceServers: iceServers,
+			sdpSemantics: 'unified-plan'
+		};
+
+		const localPeerConnection = new RTCPeerConnection(pcOptions);
+		const remotePeerConnection = new RTCPeerConnection(pcOptions);
+		
+		const members =		new Map();
+		const videos = 		$('videos');
+
+		const transactions = new Map();
+
+		function setTransaction(transaction) {
+			
+			const transactionKey = 'xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+				var r = Math.random()*16|0, v = c == 'x' ? r : (r&0x3|0x8);
+				return v.toString(16);
+			});
+			
+			console.log(`setting transaction: ${transactionKey} : ${JSON.stringify(transaction)}`);
+			transactions.set(transactionKey, transaction);
+			
+			return transactionKey;
+		}
+		
+		function getTransaction(transactionKey) {
+			
+			const transaction = transactions.get(transactionKey);
+			if (transaction) transactions.delete(transactionKey);
+
+			console.log(`getting transaction: ${transactionKey} : ${JSON.stringify(transaction)}`);
+		
+			return transaction;
+		}
+
+		$('goButton').addEventListener('click', (event) => {
+
+			myName = window.prompt('Your Name:');
+			if (myName == null || myName == '') return;
+			
+			myUUid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+					var r = Math.random()*16|0, v = c == 'x' ? r : (r&0x3|0x8);
+					return v.toString(16);
+				});
+
+			myIdentifier.name = myName;
+			myIdentifier.uuid = myUUid;
+
+			console.log(`##########  myIdentifier: ${JSON.stringify(myIdentifier)}`);
+			console.log(`Opening websocket ${janusUrl}`);
+			webSocket = new WebSocket(janusUrl, 'janus-protocol');
+			webSocket.onopen	= wsOpen;
+			webSocket.onclose	= wsClose;
+			webSocket.onmessage	= wsMessage;
+
+		});
+		
+		function wsOpen(event) {
+
+			console.log(`Web Socket Opened ${janusUrl}`);
+
+			const request = {
+				'janus' : 'create',
+				'transaction' : setTransaction({'name' : 'createSession'}),
+				'apisecret' : apiSecret
+			};
+			
+			wsSend(request);
+		}
+		
+		function wsClose(event) {
+			clearInterval(keepAliveTimer);
+			console.log(`Web Socket Closed ${janusUrl}`);
+		}
+		
+		function wsKeepAlive(event) {
+		
+			const request = {
+				"janus" : "keepalive",
+				"session_id" : sessionId,
+				'transaction' : 'keepAlive',
+				'apisecret' : apiSecret
+			};
+
+			const payload = JSON.stringify(request);
+			webSocket.send(payload);
+		}
+		
+		function wsSend(message) {
+		
+			const payload = JSON.stringify(message);
+			console.log(`sending Message\n${payload}`);
+			webSocket.send(payload);
+		}
+		
+		function sendPluginMessage(transaction, body, jsep) {
+		
+			const message = {
+				'janus' : 'message',
+				'session_id' : sessionId,
+				'handle_id' : pluginId,
+				'transaction' : setTransaction(transaction),
+				'apisecret' : apiSecret,
+				'body' : body
+			};
+			
+			if (jsep) {
+				message.jsep = jsep;
+			}
+			
+			wsSend(message);
+		}
+		
+		function wsMessage(event) {
+
+			const message		= event.data;
+			const response		= JSON.parse(message);
+			
+			const janus			= response.janus;
+			const transactionKey = response.transaction;
+			const data			= response.data;
+			const pluginData	= response.plugindata;
+			const dataData		= response.plugindata ? response.plugindata.data : null;
+			
+			const jsep			= response.jsep;
+			const candidate		= response.candidate;
+
+			if (transactionKey == 'keepAlive') return;
+
+			console.log(`message received\n${message}`);
+
+			if (janus == 'ack') return;
+
+			if (candidate)	{
+				remotePeerConnection.addIceCandidate(candidate);
+			}
+
+			if (jsep) {
+				if (jsep.type == 'answer') {
+					console.log(`setting remote description`);
+				
+					localPeerConnection.setRemoteDescription(jsep)
+					.then(() => {
+						console.log(`Description received, peer Connection set`);
+					});
+				} else {
+				
+					console.log(`setting remoteOffer on remote peer connection`);
+					remotePeerConnection.setRemoteDescription(jsep)
+					.then(() => {
+						return remotePeerConnection.createAnswer();
+					})
+					.then((answer) => {
+						return remotePeerConnection.setLocalDescription(answer);
+					})
+					.then(() => {
+						console.log('remote peer connection answered');
+
+						sendPluginMessage(
+							{'name':'makeOffer'}, 
+							{'request': 'publish'}, 
+							{'type': 'offer', 'sdp': offer.sdp}
+						);
+						wsSend({
+							'janus' : 'attach',
+							'session_id' : sessionId,
+							'plugin' : 'janus.plugin.videoroom',
+							'trickle' : 'true',
+							'transaction' : setTransaction({'name':'attachLocal'}),
+							'apisecret' : apiSecret
+						});
+
+
+					});					
+				}
+			}
+
+			if (janus == 'success') {
+			
+				const transaction	= getTransaction(response.transaction);
+				if (!transaction) return;
+			
+				if (transaction.name == 'createSession') {
+
+					sessionId = data.id;
+					console.log(`session ${sessionId} created`);
+					keepAliveTimer = setInterval(wsKeepAlive, keepAlivePeriod);
+					console.log(`keepAlive started`);
+					
+					wsSend({
+						'janus' : 'attach',
+						'session_id' : sessionId,
+						'plugin' : 'janus.plugin.videoroom',
+						'trickle' : 'true',
+						'transaction' : setTransaction({'name':'attachLocal'}),
+						'apisecret' : apiSecret
+					});
+
+				} else if (transaction.name == 'attachLocal') {
+					pluginId = data.id;
+					sendPluginMessage(
+						{'name':'roomExists'},
+						{'room' : roomId, 'request' : 'exists'}
+					);
+
+				} else if (transaction.name == 'roomExists') {
+				
+					if (dataData.exists) {
+
+						sendPluginMessage(
+							{'name':'joinLocal'}, {
+								'room' : roomId, 
+								'request' : 'join', 
+								'ptype': 'publisher', 
+								'use_msid' : true,
+								'display':  JSON.stringify(myIdentifier) 
+							});
+
+					} else {
+						sendPluginMessage (
+							{'name':'createRoom'}, 
+							{'room' : roomId, 'request' : 'create'}
+						);
+					}
+
+				} else if (transaction.name == 'createRoom') {
+					sendPluginMessage(
+						{'name':'joinLocal'}, {
+							'room' : roomId, 
+							'request' : 'join', 
+							'ptype': 'publisher', 
+							'use_msid' : true,
+							'display':  JSON.stringify(myIdentifier) 
+						});
+				
+				} else if (transaction.name == 'attachRemote') {
+					
+					const remoteId = transaction.remoteId;
+					const remotePluginId = data.id;
+					const member = members.get(remoteId);
+					member.pluginId = remotePluginId;
+					
+					const message = {
+						'janus' : 'message',
+						'session_id' : sessionId,
+						'handle_id' : remotePluginId,
+						'transaction' : setTransaction({'name' : 'joinRemote', 'pluginId' : remotePluginId, 'remoteId' : remoteId}),
+						'apisecret' : apiSecret,
+						'body' : {
+							'room' : roomId, 
+							'request' : 'join',
+							'ptype': 'subscriber',
+							'use_msid' : true,
+							'feed' : remoteId,
+							'private_id' : privateId
+						}
+					};
+			
+					wsSend(message);
+	
+				}
+			} else if (janus == 'webrtcup') {
+			
+			} else if (janus == 'event') {
+
+				if (dataData.result == 'done') {
+					localPeerConnection.close();
+					return;
+				}
+			
+				if (dataData.publishers) {
+				
+					const remotePublishers = dataData.publishers;
+					
+					for(const remotePublisher of remotePublishers) {
+					
+						const remoteId = remotePublisher.id;
+						const remoteIdentifier = JSON.parse(remotePublisher.display);
+						
+						let member = members.get(remoteId);
+						
+						if (!member){
+							console.log(`adding remote publisher: ${remoteId}\n${JSON.stringify(remoteIdentifier)}`);
+							member = {'id' : remoteId, 'identifier': remoteIdentifier};
+							members.set(remoteId, member);
+						}
+						
+						attachMember(member);
+					}
+				}
+
+				const transaction	= getTransaction(response.transaction);
+				if (!transaction) return;
+			
+				if (transaction.name == 'joinLocal') {
+				
+					localId = dataData.id;
+					privateId = dataData.private_id;
+					const member = {'id' : localId, 'identifier': myIdentifier, 'pluginId' : pluginId};
+					members.set(localId, member);
+					openLocalPeerConnection();
+				}
+
+			} else if (janus == 'hangup') {
+				
+				webSocket.close();
+			}
+		}
+
+		function attachMember(member) {
+		
+			if (localPeerConnection.connectionState == 'connected') {
+				if (!member.pluginId) {
+
+					console.log(`attaching member ${JSON.stringify(member)} ${localPeerConnection.connectionState} ${member.pluginId}`);
+				
+					wsSend({
+						'janus' : 'attach',
+						'session_id' : sessionId,
+						'plugin' : 'janus.plugin.videoroom',
+						'transaction' : setTransaction({'name' : 'attachRemote', 'remoteId' : member.id }),
+						'apisecret' : apiSecret
+					});
+				}
+			}
+		}
+
+
+		function openLocalPeerConnection() {
+
+			const pcOptions = {
+				iceServers: iceServers,
+				sdpSemantics: 'unified-plan'
+			};
+
+			console.log(`opening localPeerConnection ${JSON.stringify(pcOptions)}`);
+
+			localPeerConnection.onconnectionstatechange		= onConnectionStateChange;
+			localPeerConnection.ondatachannel				= onPeerConnection;
+			localPeerConnection.onicecandidate 				= onIceCandidate;
+			localPeerConnection.onicecandidateerror			= onPeerConnection;
+			localPeerConnection.oniceconnectionstatechange	= onPeerConnection;
+			localPeerConnection.onicegatheringstatechange	= onPeerConnection;
+			localPeerConnection.onnegotiationneeded			= negotiate;
+			localPeerConnection.onsignalingstatechange		= onPeerConnection;
+			localPeerConnection.ontrack						= onTrack;
+
+			console.log(`Created peer connection`);
+			
+			const mediaStreamConstraints = {'audio': false, 'video': true};
+
+			navigator.mediaDevices.getUserMedia(mediaStreamConstraints)
+			.then((mediaStream) => {
+				for (const track of mediaStream.getTracks()) {
+					//localTrack(track);
+					localPeerConnection.addTrack(track);					// will trigger negotiation
+				}
+			});		
+			
+			//negotiate();
+		}
+		
+		function negotiate(event) {
+		
+			const offerOptions = {'offerToReceiveVideo': true, 'offerToReceiveAudio': false};
+			
+			localPeerConnection.createOffer(offerOptions)
+			.then((offer) =>{
+			
+				localPeerConnection.setLocalDescription(offer);
+
+				sendPluginMessage(
+					{'name':'makeOffer'}, 
+					{'request': 'publish'}, 
+					{'type': 'offer', 'sdp': offer.sdp}
+				);
+			});
+		}
+
+		function localTrack(track) {
+
+			const identifier = myIdentifier;
+			const member = members.get(identifier);
+			
+			const videoId = `video_${identifier.uuid}`;
+			const paragraphId = `paragraph_${identifier.uuid}`;
+			
+			let paragraph = $(paragraphId);
+			if (!paragraph) {
+			
+				paragraph =				document.createElement('p');
+				paragraph.id =			paragraphId;
+				const label = 			document.createElement('label');
+					label.innerText = 	`${identifier.name}\n`;
+					paragraph.appendChild(label);
+
+				videos.appendChild(paragraph);
+			}
+
+			let video = $(videoId);
+			
+			if (!video) {
+			
+				video = 					document.createElement('video');
+					video.id = 				videoId;
+					video.srcObject = 		new MediaStream();
+					video.autoplay = 		true;
+					video.playsinline = 	true;
+					video.controls = 		false;
+					video.muted = 			true;
+					video.classList.add('local');
+					paragraph.appendChild(video);
+			}
+			
+			const mediaStream = video.srcObject;
+			
+			mediaStream.addTrack(track);
+		}
+
+		function onConnectionStateChange(event) {
+		
+			console.log(`${event.type} - ${localPeerConnection.connectionState}`);
+		
+			if (localPeerConnection.connectionState == 'connected') {
+				members.forEach(
+					(member, id, map) => {
+						attachMember(member);
+					}
+				);
+			}
+		}
+
+		function onPeerConnection(event) {
+		
+			if (event.type == 'iceconnectionstatechange')	{console.log(`${event.type} - ${localPeerConnection.iceConnectionState}`); return;}
+			if (event.type == 'icegatheringstatechange')	{console.log(`${event.type} - ${localPeerConnection.iceGatheringState}`); return;}
+			if (event.type == 'signalingstatechange')		{console.log(`${event.type} - ${localPeerConnection.signalingState}`); return;}
+			
+			console.log(`onPeerConnection: ${event.type}`);
+		}
+		
+		function onIceCandidate(event) {
+		
+			const candidate = event.candidate;
+			console.log(`${event.type} - ${candidate}`);
+
+			const request = {
+				'janus' : 'trickle'
+			};
+			
+			if (candidate) {
+				request.candidate = { 
+					candidate: candidate.candidate,
+					sdpMid: candidate.sdpMid,
+					sdpMLineIndex: candidate.sdpMLineIndex
+				};
+				request.transaction = 'iceCandidate';
+					
+			} else {
+				request.candidate = { 'completed' : true };
+				request.transaction = 'iceComplete';
+			}
+			
+			request.session_id = sessionId;
+			request.handle_id = pluginId;
+			request.apisecret = apiSecret;
+	
+			const message = JSON.stringify(request);
+			console.log(`sending candidate\n${message}`);
+			webSocket.send(message);
+		}
+
+		function onTrack(event) {
+			
+			const track = event.track;
+
+			console.log(`@#@#@#@#@#@#@#@#@#@#@#@#@#@#@#@#@ got a remote track ${track}`);
+
+			if(track.onended) return;
+
+			track.onended = (event) => {
+			
+				console.log(`remote track ended:\n`, track);
+			}
+			
+			track.onmute = (event) => {
+				console.log(`remote track muted:\n`, track);
+
+			}
+			
+			track.onunmute = (event) => {
+				console.log(`remote track unmuted:\n`, track);
+
+			}
+
+			
+		}
+		
+
+		</script>
+	</body>
+</html>
